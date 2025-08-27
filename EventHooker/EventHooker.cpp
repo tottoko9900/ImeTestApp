@@ -1,6 +1,8 @@
 ﻿#include "pch.h"
 #include "framework.h"
 #include "EventHooker.h"
+#include <iostream>
+#include <format>
 #include <imm.h>
 #include <Windows.h>
 
@@ -8,22 +10,33 @@
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
-HHOOK     EventHooker::m_hHook = NULL;
-HINSTANCE EventHooker::m_hInst = NULL;
+template<class... Args> 
+void TraceLog(const std::wstring& log, Args... args) 
+{ 
+    std::wstring formatLog = std::vformat(log, std::make_wformat_args(args...));
+    OutputDebugString(formatLog.c_str()); 
+}
 
-EventHooker::EventHooker()
+EventHooker::EventHooker() : m_hHook(nullptr), m_hDllInstance(nullptr)
 {
-    m_hInst = (HINSTANCE)&__ImageBase;
+    m_hDllInstance = (HINSTANCE)&__ImageBase;
+}
+
+EventHooker::~EventHooker()
+{
+    if(m_hHook)
+    {
+        UnstallHook();
+    }
 }
 
 void EventHooker::InstallHook()
 {
-    OutputDebugString(L"$$$ : EventHooker::InstallHook()");
-    //m_hHook = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, m_hInst, 0);
-    m_hHook = SetWindowsHookEx(WH_CALLWNDPROC, CallWndProc, m_hInst, 0);
+    m_hHook = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, m_hDllInstance, 0);
     if(!m_hHook)
     {
-        OutputDebugString(L"$$$ : SetWindowsHookEx() Failed!!");
+        DWORD errorCode = GetLastError();
+        TraceLog(L"EventHooker::InstallHook() Failed. ErrorCode = 0x{:X}", errorCode);
     }
 }
 
@@ -34,26 +47,27 @@ void EventHooker::UnstallHook()
         BOOL result = UnhookWindowsHookEx(m_hHook);
         if(!result)
         {
-            OutputDebugString(L"$$$ : UnhookWindowsHookEx() Failed!!");
+            DWORD errorCode = GetLastError();
+            TraceLog(L"EventHooker::UnstallHook() Failed. ErrorCode = 0x{:X}", errorCode);
         }
-        m_hHook = NULL;
+        m_hHook = nullptr;
     }
 }
 
-LRESULT CALLBACK EventHooker::CallWndProc(int nCode, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK EventHooker::GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if(nCode == HC_ACTION)
+    if(nCode == HC_ACTION && wParam == PM_REMOVE)
     {
-        CWPSTRUCT* p = (CWPSTRUCT*)lParam;
+        MSG* pMsg = reinterpret_cast<MSG*>(lParam);
 
-        if(p->message == WM_IME_COMPOSITION)
+        if(pMsg->message == WM_IME_COMPOSITION)
         {
-            OutputDebugString(L"$$$ : CallWndProc() Receive WM_IME_COMPOSITION");
-            HWND hWnd = p->hwnd;
+            TraceLog(L"EventHooker::GetMsgProc()  Receive WM_IME_COMPOSITION");
+            HWND hWnd = pMsg->hwnd;
             HIMC hImc = ImmGetContext(hWnd);
             if(hImc)
             {
-                if(p->lParam & GCS_RESULTSTR)
+                if(pMsg->lParam & GCS_RESULTSTR)
                 {
                     LONG size = ImmGetCompositionString(hImc, GCS_RESULTSTR, nullptr, 0);
                     if(size > 0)
@@ -69,7 +83,7 @@ LRESULT CALLBACK EventHooker::CallWndProc(int nCode, WPARAM wParam, LPARAM lPara
                         }
                     }
                 }
-                else if(p->lParam & GCS_COMPSTR)
+                else if(pMsg->lParam & GCS_COMPSTR)
                 {
                     LONG size = ImmGetCompositionString(hImc, GCS_COMPSTR, nullptr, 0);
                     if(size > 0)
@@ -90,50 +104,21 @@ LRESULT CALLBACK EventHooker::CallWndProc(int nCode, WPARAM wParam, LPARAM lPara
             }
             else
             {
-                OutputDebugString(L"$$$ : ImmGetContext() Failed!!");
+                DWORD errorCode = GetLastError();
+                TraceLog(L"EventHooker::GetMsgProc() ImmGetContext() Failed. ErrorCode = 0x{:X}", errorCode);
             }
         }
     }
 
-    return CallNextHookEx(m_hHook, nCode, wParam, lParam);
-}
-
-LRESULT CALLBACK EventHooker::GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if(nCode == HC_ACTION)
-    {
-        MSG* p = (MSG*)lParam;
-
-        if(p->message == WM_IME_COMPOSITION)
-        {
-            OutputDebugString(L"$$$ : GetMsgProc() Receive WM_IME_COMPOSITION");
-            HWND hWnd = p->hwnd;
-            HIMC hImc = ImmGetContext(hWnd);
-            if(hImc)
-            {
-                if(p->lParam & GCS_RESULTSTR)
-                {
-                    OutputDebugString(L"$$$ : GetMsgProc()   GCS_RESULTSTR");
-                }
-
-                ImmReleaseContext(hWnd, hImc);
-            }
-            else
-            {
-                OutputDebugString(L"$$$ : ImmGetContext() Failed!!");
-            }
-        }
-    }
-
-    return CallNextHookEx(m_hHook, nCode, wParam, lParam);
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
 void EventHooker::SendCompositionString(HWND hTargetWnd, const std::wstring& text)
 {
     COPYDATASTRUCT cds;
     cds.dwData = 1;
-    cds.cbData = (text.size() + 1) * sizeof(wchar_t);
+    cds.cbData = static_cast<DWORD>((text.size() + 1) * sizeof(wchar_t));
     cds.lpData = (PVOID)text.c_str();
 
-    SendMessage(hTargetWnd, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cds);
+    SendMessage(hTargetWnd, WM_COPYDATA, 0, (LPARAM)&cds);
 }
